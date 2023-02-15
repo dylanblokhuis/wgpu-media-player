@@ -1,0 +1,6 @@
+{
+  "rust-analyzer.cargo.extraEnv": {
+    "FFMPEG_PKG_CONFIG_PATH": "${HOME}/ffmpeg_build/lib/pkgconfig",
+    "FFMPEG_INCLUDE_DIR": "${HOME}/ffmpeg_build/include"
+  }
+}
