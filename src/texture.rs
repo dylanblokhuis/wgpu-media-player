@@ -1,7 +1,4 @@
-use std::num::NonZeroU32;
-
 use anyhow::*;
-use image::{ImageBuffer, Rgba};
 
 pub struct Texture {
     pub texture: wgpu::Texture,
@@ -44,24 +41,5 @@ impl Texture {
             view,
             sampler,
         })
-    }
-
-    pub fn write(&self, rgba: &ImageBuffer<Rgba<u8>, Vec<u8>>, queue: &wgpu::Queue) {
-        let dimensions = rgba.dimensions();
-        queue.write_texture(
-            wgpu::ImageCopyTexture {
-                aspect: wgpu::TextureAspect::All,
-                texture: &self.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-            },
-            rgba,
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: NonZeroU32::new(4 * dimensions.0),
-                rows_per_image: NonZeroU32::new(dimensions.1),
-            },
-            self.texture.size(),
-        );
     }
 }

@@ -1,12 +1,14 @@
 use crossbeam_channel::Sender;
-use rodio::OutputStream;
-use rusty_ffmpeg::ffi::*;
+use rodio::{buffer::SamplesBuffer, OutputStream};
+use stainless_ffmpeg::prelude::FormatContext;
+use stainless_ffmpeg::prelude::*;
 use std::{
-    ffi::{c_void, CStr, CString},
+    collections::{HashMap, VecDeque},
     num::NonZeroU32,
-    ptr::null_mut,
     slice,
-    time::Duration,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+    u8,
 };
 use wgpu::util::DeviceExt;
 use winit::{
@@ -15,6 +17,7 @@ use winit::{
     window::Window,
 };
 
+// mod resampler;
 mod texture;
 
 fn main() {
@@ -263,16 +266,18 @@ async fn run(event_loop: EventLoop<UserEvent>, window: Window) {
     let num_indices = INDICES.len() as u32;
 
     // channel
-    let (sender, receiver) = crossbeam_channel::bounded::<Vec<u8>>(1);
+    let (video_sender, video_receiver) = crossbeam_channel::bounded::<Vec<u8>>(1);
 
     std::thread::spawn(move || {
-        main_ffmpeg(sender);
+        decode_video_and_play_audio(video_sender);
     });
 
     let event_proxy = event_loop.create_proxy();
     std::thread::spawn(move || loop {
         event_proxy
-            .send_event(UserEvent::NewFrameReady(receiver.clone().recv().unwrap()))
+            .send_event(UserEvent::NewFrameReady(
+                video_receiver.clone().recv().unwrap(),
+            ))
             .unwrap();
     });
 
@@ -377,243 +382,211 @@ async fn run(event_loop: EventLoop<UserEvent>, window: Window) {
     });
 }
 
-fn main_ffmpeg(sender: Sender<Vec<u8>>) {
-    unsafe {
-        let mut av_f_ctx = avformat_alloc_context();
+fn decode_video_and_play_audio(video_sender: Sender<Vec<u8>>) {
+    let path = std::env::args().nth(1).expect("No file provided");
+    let mut format_context = FormatContext::new(&path).unwrap();
+    format_context.open_input().unwrap();
 
-        let url = CString::new("/home/dylan/wgplayer/saga.mkv").unwrap();
+    let mut first_audio_stream = None;
+    let mut first_video_stream = None;
+    for i in 0..format_context.get_nb_streams() {
+        let stream_type = format_context.get_stream_type(i as isize);
+        println!("Stream {}: {:?}", i, stream_type);
 
-        avformat_open_input(&mut av_f_ctx, url.as_ptr(), null_mut(), null_mut());
+        if stream_type == AVMediaType::AVMEDIA_TYPE_AUDIO {
+            first_audio_stream = Some(i as isize);
+        }
+        if stream_type == AVMediaType::AVMEDIA_TYPE_VIDEO {
+            first_video_stream = Some(i as isize);
+        }
+    }
 
-        let format_context = av_f_ctx.as_mut().unwrap();
+    let first_audio_stream = first_audio_stream.unwrap();
+    let first_video_stream = first_video_stream.unwrap();
 
-        let format_name = CStr::from_ptr((*format_context.iformat).name)
-            .to_str()
+    let audio_decoder = AudioDecoder::new(
+        "audio_decoder".to_string(),
+        &format_context,
+        first_audio_stream,
+    )
+    .unwrap();
+
+    let video_decoder = VideoDecoder::new(
+        "video_decoder".to_string(),
+        &format_context,
+        first_video_stream,
+    )
+    .unwrap();
+
+    let mut audio_graph = FilterGraph::new().unwrap();
+
+    //  audio graph
+    let audio_graph = {
+        audio_graph
+            .add_input_from_audio_decoder("source_audio", &audio_decoder)
             .unwrap();
 
-        println!(
-            "format {}, duration {} us, bit_rate {}",
-            format_name, format_context.duration, format_context.bit_rate
+        let mut parameters = HashMap::new();
+        parameters.insert(
+            "sample_rates".to_string(),
+            ParameterValue::String("48000".to_string()),
+        );
+        parameters.insert(
+            "channel_layouts".to_string(),
+            ParameterValue::String("stereo".to_string()),
+        );
+        parameters.insert(
+            "sample_fmts".to_string(),
+            ParameterValue::String("s32".to_string()),
         );
 
-        avformat_find_stream_info(format_context, null_mut());
+        let filter = Filter {
+            name: "aformat".to_string(),
+            label: Some("Format audio samples".to_string()),
+            parameters,
+            inputs: None,
+            outputs: None,
+        };
 
-        let mut video_stream = None;
-        let mut audio_stream = None;
-        let mut video_params = None;
-        let mut audio_params = None;
-        let mut video_codec = None;
-        let mut audio_codec = None;
+        let filter = audio_graph.add_filter(&filter).unwrap();
+        audio_graph.add_audio_output("main_audio").unwrap();
 
-        for i in 0..format_context.nb_streams {
-            let stream = *format_context.streams.offset(i as isize);
-            let _params = (*stream).codecpar;
+        audio_graph
+            .connect_input("source_audio", 0, &filter, 0)
+            .unwrap();
+        audio_graph
+            .connect_output(&filter, 0, "main_audio", 0)
+            .unwrap();
+        audio_graph.validate().unwrap();
 
-            if (*_params).codec_type == AVMediaType_AVMEDIA_TYPE_VIDEO && video_stream.is_none() {
-                println!(
-                    "video width: {}, height: {}",
-                    (*_params).width,
-                    (*_params).height
-                );
-                video_stream = Some(i);
-                video_codec = Some(avcodec_find_decoder((*_params).codec_id));
-                video_params = Some(_params);
-            }
+        audio_graph
+    };
 
-            if (*_params).codec_type == AVMediaType_AVMEDIA_TYPE_AUDIO && audio_stream.is_none() {
-                println!(
-                    "audio channels: {}, sample rate {}",
-                    (*_params).codec_id,
-                    (*_params).sample_rate
-                );
-                audio_stream = Some(i);
-                audio_codec = Some(avcodec_find_decoder((*_params).codec_id));
-                audio_params = Some(_params);
+    let video_graph = {
+        let mut video_graph = FilterGraph::new().unwrap();
+        video_graph
+            .add_input_from_video_decoder("source_video", &video_decoder)
+            .unwrap();
+
+        let mut parameters = HashMap::new();
+        parameters.insert(
+            "pix_fmts".to_string(),
+            ParameterValue::String("rgba".to_string()),
+        );
+
+        let filter = Filter {
+            name: "format".to_string(),
+            label: Some("Format video".to_string()),
+            parameters,
+            inputs: None,
+            outputs: None,
+        };
+
+        let filter = video_graph.add_filter(&filter).unwrap();
+        video_graph.add_video_output("main_video").unwrap();
+
+        video_graph
+            .connect_input("source_video", 0, &filter, 0)
+            .unwrap();
+        video_graph
+            .connect_output(&filter, 0, "main_video", 0)
+            .unwrap();
+        video_graph.validate().unwrap();
+
+        video_graph
+    };
+
+    let video_queue = Arc::new(Mutex::new(VecDeque::<(f64, Vec<u8>)>::new()));
+
+    let video_queue_clone = video_queue.clone();
+
+    // video thread
+    std::thread::spawn(move || loop {
+        let mut time_to_wait_inside = 0.0;
+        let now = Instant::now();
+        if let Some((time_to_wait, frame)) = video_queue_clone.lock().unwrap().pop_front() {
+            video_sender.send(frame).unwrap();
+            time_to_wait_inside = time_to_wait;
+        }
+
+        let elapsed = now.elapsed().as_micros() as u64;
+
+        if time_to_wait_inside != 0.0 {
+            let in_millis = (time_to_wait_inside * 1_000_000.0) as u64;
+            let dur = Duration::from_micros((in_millis - elapsed) - 10250);
+            println!("Waiting time: {}micros", dur.as_micros());
+            std::thread::sleep(dur);
+        }
+    });
+
+    let (_stream, stream_handle) =
+        OutputStream::try_default().expect("cant find any audio drivers");
+    let sink = rodio::Sink::try_new(&stream_handle).unwrap();
+
+    // unsafe {
+    //     av_seek_frame(
+    //         format_context.format_context,
+    //         first_video_stream as i32,
+    //         200000,
+    //         0,
+    //     );
+    // }
+
+    loop {
+        if video_queue.lock().unwrap().len() >= 10 && sink.len() >= 10 {
+            continue;
+        }
+
+        let Ok(packet) = format_context.next_packet() else {
+            break;
+        };
+
+        if packet.get_stream_index() == first_video_stream {
+            let frame = video_decoder.decode(&packet).unwrap();
+            let (_, frames) = video_graph.process(&[], &[frame]).unwrap();
+            let frame = frames.first().unwrap();
+
+            unsafe {
+                let stream = format_context.get_stream(first_video_stream);
+                let timebase = (*stream).time_base;
+                let pts = av_q2d(timebase) * (*frame.frame).best_effort_timestamp as f64;
+                let duration = av_q2d(timebase) * (*frame.frame).pkt_duration as f64;
+
+                // calculate the timestamp of the next frame in seconds
+                let next_pts = pts + duration;
+
+                let wait_time_in_seconds = next_pts - pts;
+                let size = (video_decoder.get_height() * (*frame.frame).linesize[0]) as usize;
+                let rgba_data = slice::from_raw_parts((*frame.frame).data[0], size).to_vec();
+
+                video_queue
+                    .lock()
+                    .unwrap()
+                    .push_back((wait_time_in_seconds, rgba_data));
             }
         }
 
-        let Some(video_stream) = video_stream else {
-            panic!("video stream not found");
-        };
+        if packet.get_stream_index() == first_audio_stream {
+            let frame = audio_decoder.decode(&packet).unwrap();
+            let (frames, _) = audio_graph.process(&[frame], &[]).unwrap();
+            let frame = frames.first().unwrap();
 
-        let Some(video_codec) = video_codec else {
-            panic!("video codec not found");
-        };
+            unsafe {
+                let size = ((*frame.frame).channels * (*frame.frame).nb_samples) as usize;
 
-        let Some(audio_codec) = audio_codec else {
-            panic!("audio codec not found");
-        };
+                let data: Vec<i32> =
+                    slice::from_raw_parts((*frame.frame).data[0] as _, size).to_vec();
+                let float_samples: Vec<f32> = data
+                    .iter()
+                    .map(|value| (*value as f32) / i32::MAX as f32)
+                    .collect();
 
-        let Some(video_params) = video_params else {
-            panic!("video params not found");
-        };
-        let Some(audio_params) = audio_params else {
-            panic!("audio params not found");
-        };
-
-        let audio_codec_ctx = avcodec_alloc_context3(audio_codec).as_mut().unwrap();
-        let ret = avcodec_parameters_to_context(audio_codec_ctx, audio_params);
-        if ret != 0 {
-            panic!("failed to set audio params");
-        }
-        avcodec_open2(audio_codec_ctx, audio_codec, null_mut());
-
-        let video_codec_ctx = avcodec_alloc_context3(video_codec).as_mut().unwrap();
-        avcodec_parameters_to_context(video_codec_ctx, video_params);
-        avcodec_open2(video_codec_ctx, video_codec, null_mut());
-
-        let audio_frame = av_frame_alloc().as_mut().unwrap();
-        let frame = av_frame_alloc().as_mut().unwrap();
-        let frame_rgb = av_frame_alloc().as_mut().unwrap();
-
-        let num_bytes = av_image_get_buffer_size(
-            AVPixelFormat_AV_PIX_FMT_RGBA,
-            video_codec_ctx.width,
-            video_codec_ctx.height,
-            32,
-        );
-        let buffer = av_malloc(num_bytes as u64) as *mut u8;
-
-        av_image_fill_arrays(
-            frame_rgb.data.as_mut_ptr(),
-            frame_rgb.linesize.as_mut_ptr(),
-            buffer,
-            AVPixelFormat_AV_PIX_FMT_RGBA,
-            video_codec_ctx.width,
-            video_codec_ctx.height,
-            32,
-        );
-
-        let packet = av_packet_alloc();
-
-        let sws_context = sws_getContext(
-            video_codec_ctx.width,
-            video_codec_ctx.height,
-            video_codec_ctx.pix_fmt,
-            video_codec_ctx.width,
-            video_codec_ctx.height,
-            AVPixelFormat_AV_PIX_FMT_RGBA,
-            SWS_BILINEAR as i32,
-            null_mut(),
-            null_mut(),
-            null_mut(),
-        );
-
-        let maybe_audio_driver = OutputStream::try_default();
-
-        while av_read_frame(format_context, packet) >= 0 {
-            if (*packet).stream_index == video_stream as i32 {
-                let ret = avcodec_send_packet(video_codec_ctx, packet);
-
-                if ret < 0 {
-                    panic!("Error sending a packet for decoding");
-                }
-
-                loop {
-                    let ret = avcodec_receive_frame(video_codec_ctx, frame);
-                    if ret == AVERROR_EOF || ret == AVERROR(EAGAIN) {
-                        break;
-                    } else if ret < 0 {
-                        panic!("Error during decoding");
-                    }
-
-                    sws_scale(
-                        sws_context,
-                        frame.data.as_ptr() as *const *const u8,
-                        frame.linesize.as_ptr(),
-                        0,
-                        video_codec_ctx.height,
-                        frame_rgb.data.as_mut_ptr(),
-                        frame_rgb.linesize.as_mut_ptr(),
-                    );
-
-                    let stream = format_context.streams.offset(video_stream as isize);
-                    let fps = av_q2d((*(*stream)).r_frame_rate);
-                    let sleep_time = (1.0 / fps) * 1000.0;
-
-                    std::thread::sleep(Duration::from_millis(sleep_time as u64));
-
-                    println!(
-                        "Frame {} (nr={})",
-                        av_get_picture_type_char(frame.pict_type),
-                        video_codec_ctx.frame_number,
-                    );
-
-                    sender
-                        .send(
-                            slice::from_raw_parts(
-                                frame_rgb.data[0],
-                                (video_codec_ctx.height * frame_rgb.linesize[0]) as usize,
-                            )
-                            .to_vec(),
-                        )
-                        .unwrap();
-                }
+                sink.append(SamplesBuffer::new(
+                    (*frame.frame).channels as _,
+                    (*frame.frame).sample_rate as _,
+                    float_samples,
+                ));
             }
-
-            if (*packet).stream_index == audio_stream.unwrap() as i32 {
-                let av_frame = av_frame_alloc();
-                let mut ret = avcodec_receive_frame(audio_codec_ctx, av_frame);
-                let mut got_frame = 0;
-                let mut len1 = 0;
-                if ret == 0 {
-                    got_frame = 1;
-                }
-                if ret == AVERROR(EAGAIN) {
-                    ret = 0;
-                }
-                if ret == 0 {
-                    ret = avcodec_send_packet(audio_codec_ctx, packet);
-                }
-                if ret == AVERROR(EAGAIN) {
-                    ret = 0;
-                } else if ret < 0 {
-                    panic!("Error during decoding");
-                } else {
-                    len1 = (*packet).size;
-                }
-
-                if len1 < 0 {
-                    println!("Yo");
-                    break;
-                }
-
-                // play audio?
-                println!("audio frame {}", (*av_frame).nb_samples);
-
-                // if ret == 0 {
-                //     ret = avcodec_send_packet(audio_codec_ctx, packet);
-                // }
-                // if ret == AVERROR(EAGAIN) {
-                //     ret = 0;
-
-                // loop {
-                //     if ret == AVERROR_EOF || ret == AVERROR(EAGAIN) {
-                //         break;
-                //     } else if ret < 0 {
-                //         panic!("Error during decoding");
-                //     }
-
-                //     println!("audio frame {}", frame.nb_samples);
-                // }
-            }
-
-            av_packet_unref(packet);
         }
-
-        // cleanup
-        av_free(buffer as *mut c_void);
-        av_frame_free(frame_rgb as *mut AVFrame as *mut *mut AVFrame);
-        av_free(frame_rgb as *mut AVFrame as *mut c_void);
-
-        // Free the YUV frame
-        av_frame_free(frame as *mut AVFrame as *mut *mut AVFrame);
-        av_free(frame as *mut AVFrame as *mut c_void);
-
-        // Close the codecs
-        avcodec_close(video_codec_ctx);
-
-        // Close the video file
-        avformat_close_input(av_f_ctx as *mut *mut AVFormatContext);
     }
 }
