@@ -1,20 +1,18 @@
 use cpal::{traits::StreamTrait, ChannelCount, SampleRate, Stream};
 use crossbeam_channel::Sender;
+use renderer::{VideoRenderer, INDICES};
 use ringbuf::{HeapConsumer, HeapRb};
 use stainless_ffmpeg::prelude::FormatContext;
 use stainless_ffmpeg::prelude::*;
-use std::{collections::HashMap, num::NonZeroU32, slice, u8};
-use wgpu::util::DeviceExt;
+use std::{collections::HashMap, slice, u8};
 use winit::{
-    dpi::PhysicalSize,
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoop, EventLoopBuilder},
     window::Window,
 };
 
-// mod resampler;
+mod renderer;
 mod texture;
-
 // Since the Rust time-functions `Duration` and `Instant` work with nanoseconds
 // by default, it is much simpler to convert a PTS to nanoseconds,
 // that is why the following constant has been added.
@@ -57,55 +55,6 @@ impl Vertex {
     }
 }
 
-fn get_vertices(size: PhysicalSize<u32>) -> Vec<Vertex> {
-    let screen_width = size.width as f32;
-    let screen_height = size.height as f32;
-
-    let desired_aspect_ratio = 16.0 / 9.0;
-
-    let mut vertex_width = 1.0;
-    let mut vertex_height = screen_width / desired_aspect_ratio / screen_height;
-    if vertex_height > 1.0 {
-        vertex_width = screen_height * desired_aspect_ratio / screen_width;
-        vertex_height = 1.0;
-    }
-
-    let top_left: [f32; 3] = [-vertex_width, vertex_height, 0.0];
-    let bottom_left: [f32; 3] = [-vertex_width, -vertex_height, 0.0];
-    let top_right: [f32; 3] = [vertex_width, vertex_height, 0.0];
-    let bottom_right: [f32; 3] = [vertex_width, -vertex_height, 0.0];
-
-    vec![
-        Vertex {
-            position: top_left,
-            tex_coords: [0.0, 0.0],
-        },
-        Vertex {
-            position: bottom_left,
-            tex_coords: [0.0, 1.0],
-        },
-        Vertex {
-            position: bottom_right,
-            tex_coords: [1.0, 1.0],
-        },
-        // second triangle
-        Vertex {
-            position: top_left,
-            tex_coords: [0.0, 0.0],
-        },
-        Vertex {
-            position: bottom_right,
-            tex_coords: [1.0, 1.0],
-        },
-        Vertex {
-            position: top_right,
-            tex_coords: [1.0, 0.0],
-        },
-    ]
-}
-
-const INDICES: &[u16] = &[0, 1, 2, 3, 4, 5];
-
 #[derive(Debug)]
 enum UserEvent {
     NewFrameReady(Vec<u8>),
@@ -144,37 +93,6 @@ async fn run(event_loop: EventLoop<UserEvent>, window: Window) {
         .await
         .expect("Failed to create device");
 
-    let texture_bind_group_layout =
-        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        multisampled: false,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    // This should match the filterable field of the
-                    // corresponding Texture entry above.
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-            label: Some("texture_bind_group_layout"),
-        });
-
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: None,
-        bind_group_layouts: &[&texture_bind_group_layout],
-        push_constant_ranges: &[],
-    });
-
     let swapchain_capabilities = surface.get_capabilities(&adapter);
     let swapchain_format = swapchain_capabilities.formats[0];
 
@@ -190,101 +108,6 @@ async fn run(event_loop: EventLoop<UserEvent>, window: Window) {
 
     surface.configure(&device, &config);
 
-    let texture_bind_group_layout =
-        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        multisampled: false,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-            label: Some("texture_bind_group_layout"),
-        });
-
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("Shader"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
-    });
-
-    let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("Render Pipeline Layout"),
-        bind_group_layouts: &[&texture_bind_group_layout],
-        push_constant_ranges: &[],
-    });
-
-    let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("Render Pipeline"),
-        layout: Some(&render_pipeline_layout),
-        vertex: wgpu::VertexState {
-            module: &shader,
-            entry_point: "vs_main",
-            buffers: &[Vertex::desc()],
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &shader,
-            entry_point: "fs_main",
-            targets: &[Some(wgpu::ColorTargetState {
-                format: config.format,
-                blend: Some(wgpu::BlendState {
-                    color: wgpu::BlendComponent::REPLACE,
-                    alpha: wgpu::BlendComponent::REPLACE,
-                }),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-        }),
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            strip_index_format: None,
-            front_face: wgpu::FrontFace::Ccw,
-            cull_mode: Some(wgpu::Face::Back),
-            // Setting this to anything other than Fill requires Features::POLYGON_MODE_LINE
-            // or Features::POLYGON_MODE_POINT
-            polygon_mode: wgpu::PolygonMode::Fill,
-            // Requires Features::DEPTH_CLIP_CONTROL
-            unclipped_depth: false,
-            // Requires Features::CONSERVATIVE_RASTERIZATION
-            conservative: false,
-        },
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState {
-            count: 1,
-            mask: !0,
-            alpha_to_coverage_enabled: false,
-        },
-        // If the pipeline will be used with a multiview render pass, this
-        // indicates how many array layers the attachments will have.
-        multiview: None,
-    });
-
-    // let aspect_ratio = size.width as f32 / size.height as f32;
-    // let vertice_height = 1.0 / aspect_ratio;
-    // println!("aspect_ratio: {}", 1.0 / aspect_ratio);
-
-    let mut vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("Vertex Buffer"),
-        contents: bytemuck::cast_slice(&get_vertices(size)),
-        usage: wgpu::BufferUsages::VERTEX,
-    });
-    let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("Index Buffer"),
-        contents: bytemuck::cast_slice(INDICES),
-        usage: wgpu::BufferUsages::INDEX,
-    });
-    let num_indices = INDICES.len() as u32;
-
-    // channel
     let (video_sender, video_receiver) = crossbeam_channel::bounded::<Vec<u8>>(1);
 
     std::thread::spawn(move || {
@@ -300,28 +123,13 @@ async fn run(event_loop: EventLoop<UserEvent>, window: Window) {
             .unwrap();
     });
 
-    let texture_to_render = texture::Texture::new(&device, (1920, 1080), Some("Video")).unwrap();
-
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        layout: &texture_bind_group_layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&texture_to_render.view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(&texture_to_render.sampler),
-            },
-        ],
-        label: Some("diffuse_bind_group"),
-    });
+    let mut renderer = VideoRenderer::new(size, &device, &config);
 
     event_loop.run(move |event, _, control_flow| {
         // Have the closure take ownership of the resources.
         // `event_loop.run` never returns, therefore we must do this to ensure
         // the resources are properly cleaned up.
-        let _ = (&instance, &adapter, &shader, &pipeline_layout);
+        let _ = (&instance, &adapter);
 
         *control_flow = ControlFlow::Wait;
 
@@ -335,12 +143,7 @@ async fn run(event_loop: EventLoop<UserEvent>, window: Window) {
                 config.height = size.height;
                 surface.configure(&device, &config);
 
-                // resize vertex buffer, black bars etc..
-                vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("Vertex Buffer"),
-                    contents: bytemuck::cast_slice(&get_vertices(size)),
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
+                renderer.handle_resize(&device, size);
 
                 // On macos the window needs to be redrawn manually after resizing
                 window.request_redraw();
@@ -368,36 +171,23 @@ async fn run(event_loop: EventLoop<UserEvent>, window: Window) {
                         })],
                         depth_stencil_attachment: None,
                     });
-                    render_pass.set_pipeline(&render_pipeline);
-                    render_pass.set_bind_group(0, &bind_group, &[]);
-                    render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-                    render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint16); // 1.
-                    render_pass.draw_indexed(0..num_indices, 0, 0..1); // 2.
+
+                    // im not going to bother -> https://github.com/gfx-rs/wgpu/issues/1453
+                    render_pass.set_pipeline(&renderer.render_pipeline);
+                    render_pass.set_bind_group(0, &renderer.bind_group, &[]);
+                    render_pass.set_vertex_buffer(0, renderer.vertex_buffer.slice(..));
+                    render_pass.set_index_buffer(
+                        renderer.index_buffer.slice(..),
+                        wgpu::IndexFormat::Uint16,
+                    );
+                    render_pass.draw_indexed(0..INDICES.len() as u32, 0, 0..1);
                 }
 
                 queue.submit(Some(encoder.finish()));
                 frame.present();
             }
             Event::UserEvent(UserEvent::NewFrameReady(data)) => {
-                queue.write_texture(
-                    wgpu::ImageCopyTexture {
-                        aspect: wgpu::TextureAspect::All,
-                        texture: &texture_to_render.texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                    },
-                    &data,
-                    wgpu::ImageDataLayout {
-                        offset: 0,
-                        bytes_per_row: NonZeroU32::new(4 * 1920),
-                        rows_per_image: NonZeroU32::new(1080),
-                    },
-                    wgpu::Extent3d {
-                        width: 1920,
-                        height: 1080,
-                        depth_or_array_layers: 1,
-                    },
-                );
+                renderer.new_frame(&queue, &data);
                 window.request_redraw();
             }
             Event::WindowEvent {
