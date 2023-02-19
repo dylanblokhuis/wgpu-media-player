@@ -533,14 +533,14 @@ fn decode_video_and_play_audio(video_sender: Sender<Vec<u8>>) {
     let stream = audio_player(audio_consumer, channels, SampleRate(resample_rate as u32));
     stream.play().unwrap();
 
-    // unsafe {
-    //     av_seek_frame(
-    //         format_context.format_context,
-    //         first_video_stream as i32,
-    //         200000,
-    //         0,
-    //     );
-    // }
+    unsafe {
+        av_seek_frame(
+            format_context.format_context,
+            first_video_stream as i32,
+            400000,
+            0,
+        );
+    }
 
     loop {
         if video_producer.len() >= 50 {
@@ -618,7 +618,6 @@ fn audio_player(
         .with_sample_rate(sample_rate);
 
     let config = supported_config.into();
-    // let mut started = false;
 
     device
         .build_output_stream(
