@@ -537,7 +537,7 @@ fn decode_video_and_play_audio(video_sender: Sender<Vec<u8>>) {
     //     av_seek_frame(
     //         format_context.format_context,
     //         first_video_stream as i32,
-    //         400000,
+    //         600000,
     //         0,
     //     );
     // }
@@ -552,7 +552,9 @@ fn decode_video_and_play_audio(video_sender: Sender<Vec<u8>>) {
         };
 
         if packet.get_stream_index() == first_video_stream {
-            let frame = video_decoder.decode(&packet).unwrap();
+            let Ok(frame) = video_decoder.decode(&packet) else {
+                continue;
+            };
             let (_, frames) = video_graph.process(&[], &[frame]).unwrap();
             let frame = frames.first().unwrap();
 
