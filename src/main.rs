@@ -1,15 +1,9 @@
+use cpal::{traits::StreamTrait, ChannelCount, SampleRate, Stream};
 use crossbeam_channel::Sender;
-use rodio::{buffer::SamplesBuffer, OutputStream};
+use ringbuf::{Consumer, RingBuffer};
 use stainless_ffmpeg::prelude::FormatContext;
 use stainless_ffmpeg::prelude::*;
-use std::{
-    collections::{HashMap, VecDeque},
-    num::NonZeroU32,
-    slice,
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
-    u8,
-};
+use std::{collections::HashMap, num::NonZeroU32, slice, u8};
 use wgpu::util::DeviceExt;
 use winit::{
     event::{Event, WindowEvent},
@@ -19,6 +13,11 @@ use winit::{
 
 // mod resampler;
 mod texture;
+
+// Since the Rust time-functions `Duration` and `Instant` work with nanoseconds
+// by default, it is much simpler to convert a PTS to nanoseconds,
+// that is why the following constant has been added.
+const ONE_NANOSECOND: i64 = 1000000000;
 
 fn main() {
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
@@ -169,8 +168,8 @@ async fn run(event_loop: EventLoop<UserEvent>, window: Window) {
         width: size.width,
         height: size.height,
         present_mode: wgpu::PresentMode::Fifo,
-        alpha_mode: swapchain_capabilities.alpha_modes[0],
-        view_formats: vec![],
+        alpha_mode: wgpu::CompositeAlphaMode::Auto,
+        view_formats: [swapchain_format].to_vec(),
     };
 
     surface.configure(&device, &config);
@@ -420,6 +419,9 @@ fn decode_video_and_play_audio(video_sender: Sender<Vec<u8>>) {
 
     let mut audio_graph = FilterGraph::new().unwrap();
 
+    let resample_rate = 48000;
+    let channels = 2;
+
     //  audio graph
     let audio_graph = {
         audio_graph
@@ -429,11 +431,15 @@ fn decode_video_and_play_audio(video_sender: Sender<Vec<u8>>) {
         let mut parameters = HashMap::new();
         parameters.insert(
             "sample_rates".to_string(),
-            ParameterValue::String("48000".to_string()),
+            ParameterValue::String(resample_rate.to_string()),
         );
         parameters.insert(
             "channel_layouts".to_string(),
-            ParameterValue::String("stereo".to_string()),
+            ParameterValue::String(if channels == 1 {
+                "mono".to_string()
+            } else {
+                "stereo".to_string()
+            }),
         );
         parameters.insert(
             "sample_fmts".to_string(),
@@ -496,32 +502,36 @@ fn decode_video_and_play_audio(video_sender: Sender<Vec<u8>>) {
         video_graph
     };
 
-    let video_queue = Arc::new(Mutex::new(VecDeque::<(f64, Vec<u8>)>::new()));
+    let (mut video_producer, mut video_consumer) = RingBuffer::<(i64, Vec<u8>)>::new(50).split();
+    let (mut audio_producer, audio_consumer) = RingBuffer::<f32>::new(50 * 1024 * 1024).split();
 
-    let video_queue_clone = video_queue.clone();
+    std::thread::spawn(move || {
+        let mut prev_pts = None;
+        let mut now = std::time::Instant::now();
 
-    // video thread
-    std::thread::spawn(move || loop {
-        let mut time_to_wait_inside = 0.0;
-        let now = Instant::now();
-        if let Some((time_to_wait, frame)) = video_queue_clone.lock().unwrap().pop_front() {
-            video_sender.send(frame).unwrap();
-            time_to_wait_inside = time_to_wait;
-        }
+        loop {
+            if let Some((pts, frame)) = video_consumer.pop() {
+                if let Some(prev) = prev_pts {
+                    let elapsed = now.elapsed();
+                    if pts > prev {
+                        let sleep_time = std::time::Duration::new(0, (pts - prev) as u32);
+                        if elapsed < sleep_time {
+                            println!("sleeping for {:?}", sleep_time - elapsed);
+                            spin_sleep::sleep(sleep_time - elapsed);
+                        }
+                    }
+                }
 
-        let elapsed = now.elapsed().as_micros() as u64;
+                prev_pts = Some(pts);
+                now = std::time::Instant::now();
 
-        if time_to_wait_inside != 0.0 {
-            let in_millis = (time_to_wait_inside * 1_000_000.0) as u64;
-            let dur = Duration::from_micros((in_millis - elapsed) - 10250);
-            println!("Waiting time: {}micros", dur.as_micros());
-            std::thread::sleep(dur);
+                video_sender.send(frame).unwrap();
+            }
         }
     });
 
-    let (_stream, stream_handle) =
-        OutputStream::try_default().expect("cant find any audio drivers");
-    let sink = rodio::Sink::try_new(&stream_handle).unwrap();
+    let stream = audio_player(audio_consumer, channels, SampleRate(resample_rate as u32));
+    stream.play().unwrap();
 
     // unsafe {
     //     av_seek_frame(
@@ -533,7 +543,7 @@ fn decode_video_and_play_audio(video_sender: Sender<Vec<u8>>) {
     // }
 
     loop {
-        if video_queue.lock().unwrap().len() >= 10 && sink.len() >= 10 {
+        if video_producer.len() >= 50 {
             continue;
         }
 
@@ -547,22 +557,16 @@ fn decode_video_and_play_audio(video_sender: Sender<Vec<u8>>) {
             let frame = frames.first().unwrap();
 
             unsafe {
-                let stream = format_context.get_stream(first_video_stream);
-                let timebase = (*stream).time_base;
-                let pts = av_q2d(timebase) * (*frame.frame).best_effort_timestamp as f64;
-                let duration = av_q2d(timebase) * (*frame.frame).pkt_duration as f64;
+                let stream = (*format_context.get_stream(first_video_stream)).time_base;
+                let pts_nano = av_rescale_q(
+                    (*frame.frame).best_effort_timestamp,
+                    stream,
+                    av_make_q(1, ONE_NANOSECOND as i32),
+                );
 
-                // calculate the timestamp of the next frame in seconds
-                let next_pts = pts + duration;
-
-                let wait_time_in_seconds = next_pts - pts;
                 let size = (video_decoder.get_height() * (*frame.frame).linesize[0]) as usize;
                 let rgba_data = slice::from_raw_parts((*frame.frame).data[0], size).to_vec();
-
-                video_queue
-                    .lock()
-                    .unwrap()
-                    .push_back((wait_time_in_seconds, rgba_data));
+                video_producer.push((pts_nano, rgba_data)).unwrap();
             }
         }
 
@@ -581,12 +585,49 @@ fn decode_video_and_play_audio(video_sender: Sender<Vec<u8>>) {
                     .map(|value| (*value as f32) / i32::MAX as f32)
                     .collect();
 
-                sink.append(SamplesBuffer::new(
-                    (*frame.frame).channels as _,
-                    (*frame.frame).sample_rate as _,
-                    float_samples,
-                ));
+                audio_producer.push_slice(&float_samples);
             }
         }
     }
+}
+
+fn audio_player(
+    mut audio_consumer: Consumer<f32>,
+    channels: ChannelCount,
+    sample_rate: SampleRate,
+) -> Stream {
+    use cpal::traits::{DeviceTrait, HostTrait};
+
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .expect("no output device available");
+
+    let mut supported_configs_range = device
+        .supported_output_configs()
+        .expect("error while querying configs");
+
+    let supported_config = supported_configs_range
+        .find(|config| {
+            config.channels() == channels
+                && sample_rate >= config.min_sample_rate()
+                && sample_rate <= config.max_sample_rate()
+                && config.sample_format() == cpal::SampleFormat::F32
+        })
+        .expect("no supported config?!")
+        .with_sample_rate(sample_rate);
+
+    let config = supported_config.into();
+    // let mut started = false;
+
+    device
+        .build_output_stream(
+            &config,
+            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                audio_consumer.pop_slice(data);
+            },
+            move |err| println!("CPAL error: {:?}", err),
+            None,
+        )
+        .unwrap()
 }
