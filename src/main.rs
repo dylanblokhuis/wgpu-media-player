@@ -1,11 +1,12 @@
 use cpal::{traits::StreamTrait, ChannelCount, SampleRate, Stream};
 use crossbeam_channel::Sender;
-use ringbuf::{Consumer, RingBuffer};
+use ringbuf::{HeapConsumer, HeapRb};
 use stainless_ffmpeg::prelude::FormatContext;
 use stainless_ffmpeg::prelude::*;
 use std::{collections::HashMap, num::NonZeroU32, slice, u8};
 use wgpu::util::DeviceExt;
 use winit::{
+    dpi::PhysicalSize,
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoop, EventLoopBuilder},
     window::Window,
@@ -22,7 +23,7 @@ const ONE_NANOSECOND: i64 = 1000000000;
 fn main() {
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let window = winit::window::Window::new(&event_loop).unwrap();
-    window.set_inner_size(winit::dpi::LogicalSize::new(1280, 720));
+    window.set_inner_size(winit::dpi::LogicalSize::new(1280, 900));
 
     pollster::block_on(run(event_loop, window));
 }
@@ -56,36 +57,52 @@ impl Vertex {
     }
 }
 
-/**
- * Two triangles that fill the whole screen and position the textures appropriately.
- */
-const VERTICES: &[Vertex] = &[
-    Vertex {
-        position: [-1.0, 1.0, 0.0],
-        tex_coords: [0.0, 0.0],
-    },
-    Vertex {
-        position: [-1.0, -1.0, 0.0],
-        tex_coords: [0.0, 1.0],
-    },
-    Vertex {
-        position: [1.0, -1.0, 0.0],
-        tex_coords: [1.0, 1.0],
-    },
-    // second triangle
-    Vertex {
-        position: [-1.0, 1.0, 0.0],
-        tex_coords: [0.0, 0.0],
-    },
-    Vertex {
-        position: [1.0, -1.0, 0.0],
-        tex_coords: [1.0, 1.0],
-    },
-    Vertex {
-        position: [1.0, 1.0, 0.0],
-        tex_coords: [1.0, 0.0],
-    },
-];
+fn get_vertices(size: PhysicalSize<u32>) -> Vec<Vertex> {
+    let screen_width = size.width as f32;
+    let screen_height = size.height as f32;
+
+    let desired_aspect_ratio = 16.0 / 9.0;
+
+    let mut vertex_width = 1.0;
+    let mut vertex_height = screen_width / desired_aspect_ratio / screen_height;
+    if vertex_height > 1.0 {
+        vertex_width = screen_height * desired_aspect_ratio / screen_width;
+        vertex_height = 1.0;
+    }
+
+    let top_left: [f32; 3] = [-vertex_width, vertex_height, 0.0];
+    let bottom_left: [f32; 3] = [-vertex_width, -vertex_height, 0.0];
+    let top_right: [f32; 3] = [vertex_width, vertex_height, 0.0];
+    let bottom_right: [f32; 3] = [vertex_width, -vertex_height, 0.0];
+
+    vec![
+        Vertex {
+            position: top_left,
+            tex_coords: [0.0, 0.0],
+        },
+        Vertex {
+            position: bottom_left,
+            tex_coords: [0.0, 1.0],
+        },
+        Vertex {
+            position: bottom_right,
+            tex_coords: [1.0, 1.0],
+        },
+        // second triangle
+        Vertex {
+            position: top_left,
+            tex_coords: [0.0, 0.0],
+        },
+        Vertex {
+            position: bottom_right,
+            tex_coords: [1.0, 1.0],
+        },
+        Vertex {
+            position: top_right,
+            tex_coords: [1.0, 0.0],
+        },
+    ]
+}
 
 const INDICES: &[u16] = &[0, 1, 2, 3, 4, 5];
 
@@ -120,8 +137,7 @@ async fn run(event_loop: EventLoop<UserEvent>, window: Window) {
                 label: None,
                 features: wgpu::Features::empty(),
                 // Make sure we use the texture resolution limits from the adapter, so we can support images the size of the swapchain.
-                limits: wgpu::Limits::downlevel_webgl2_defaults()
-                    .using_resolution(adapter.limits()),
+                limits: wgpu::Limits::default(),
             },
             None,
         )
@@ -252,9 +268,13 @@ async fn run(event_loop: EventLoop<UserEvent>, window: Window) {
         multiview: None,
     });
 
-    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    // let aspect_ratio = size.width as f32 / size.height as f32;
+    // let vertice_height = 1.0 / aspect_ratio;
+    // println!("aspect_ratio: {}", 1.0 / aspect_ratio);
+
+    let mut vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Vertex Buffer"),
-        contents: bytemuck::cast_slice(VERTICES),
+        contents: bytemuck::cast_slice(&get_vertices(size)),
         usage: wgpu::BufferUsages::VERTEX,
     });
     let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -314,6 +334,14 @@ async fn run(event_loop: EventLoop<UserEvent>, window: Window) {
                 config.width = size.width;
                 config.height = size.height;
                 surface.configure(&device, &config);
+
+                // resize vertex buffer, black bars etc..
+                vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Vertex Buffer"),
+                    contents: bytemuck::cast_slice(&get_vertices(size)),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+
                 // On macos the window needs to be redrawn manually after resizing
                 window.request_redraw();
             }
@@ -334,7 +362,7 @@ async fn run(event_loop: EventLoop<UserEvent>, window: Window) {
                             view: &view,
                             resolve_target: None,
                             ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                                 store: true,
                             },
                         })],
@@ -502,8 +530,8 @@ fn decode_video_and_play_audio(video_sender: Sender<Vec<u8>>) {
         video_graph
     };
 
-    let (mut video_producer, mut video_consumer) = RingBuffer::<(i64, Vec<u8>)>::new(50).split();
-    let (mut audio_producer, audio_consumer) = RingBuffer::<f32>::new(50 * 1024 * 1024).split();
+    let (mut video_producer, mut video_consumer) = HeapRb::<(i64, Vec<u8>)>::new(50).split();
+    let (mut audio_producer, audio_consumer) = HeapRb::<f32>::new(50 * 1024 * 1024).split();
 
     std::thread::spawn(move || {
         let mut prev_pts = None;
@@ -594,7 +622,7 @@ fn decode_video_and_play_audio(video_sender: Sender<Vec<u8>>) {
 }
 
 fn audio_player(
-    mut audio_consumer: Consumer<f32>,
+    mut audio_consumer: HeapConsumer<f32>,
     channels: ChannelCount,
     sample_rate: SampleRate,
 ) -> Stream {
