@@ -1,10 +1,9 @@
 use cpal::{traits::StreamTrait, ChannelCount, SampleRate, Stream};
-use crossbeam_channel::Sender;
 use renderer::{VideoRenderer, INDICES};
 use ringbuf::{HeapConsumer, HeapRb};
 use stainless_ffmpeg::prelude::FormatContext;
 use stainless_ffmpeg::prelude::*;
-use std::{collections::HashMap, slice, u8};
+use std::{collections::HashMap, slice, u8, sync::{Arc, Mutex}};
 use winit::{
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoop, EventLoopBuilder},
@@ -79,22 +78,16 @@ async fn run(event_loop: EventLoop<UserEvent>, window: Window) {
 
     surface.configure(&device, &config);
 
-    let (video_sender, video_receiver) = crossbeam_channel::bounded::<Vec<u8>>(1);
-
+    let repaint_proxy = Arc::new(Mutex::new(event_loop.create_proxy()));
     std::thread::spawn(move || {
-        decode_video_and_play_audio(video_sender);
+        decode_video_and_play_audio(move |frame| {
+            repaint_proxy.lock().unwrap()
+                .send_event(UserEvent::NewFrameReady(frame))
+                .unwrap();
+        });
     });
 
-    let event_proxy = event_loop.create_proxy();
-    std::thread::spawn(move || loop {
-        event_proxy
-            .send_event(UserEvent::NewFrameReady(
-                video_receiver.clone().recv().unwrap(),
-            ))
-            .unwrap();
-    });
-
-    let mut renderer = VideoRenderer::new(size, &device, &config);
+    let mut renderer = Some(VideoRenderer::new(size, &device, &config));
 
     event_loop.run(move |event, _, control_flow| {
         // Have the closure take ownership of the resources.
@@ -114,7 +107,9 @@ async fn run(event_loop: EventLoop<UserEvent>, window: Window) {
                 config.height = size.height;
                 surface.configure(&device, &config);
 
-                renderer.handle_resize(&device, size);
+                if let Some(renderer) = renderer.as_mut() {
+                    renderer.handle_resize(&device, size);
+                }
 
                 // On macos the window needs to be redrawn manually after resizing
                 window.request_redraw();
@@ -143,22 +138,26 @@ async fn run(event_loop: EventLoop<UserEvent>, window: Window) {
                         depth_stencil_attachment: None,
                     });
 
-                    // im not going to bother -> https://github.com/gfx-rs/wgpu/issues/1453
-                    render_pass.set_pipeline(&renderer.render_pipeline);
-                    render_pass.set_bind_group(0, &renderer.bind_group, &[]);
-                    render_pass.set_vertex_buffer(0, renderer.vertex_buffer.slice(..));
-                    render_pass.set_index_buffer(
-                        renderer.index_buffer.slice(..),
-                        wgpu::IndexFormat::Uint16,
-                    );
-                    render_pass.draw_indexed(0..INDICES.len() as u32, 0, 0..1);
+                    if let Some(renderer) = renderer.as_mut() {
+                       // im not going to bother -> https://github.com/gfx-rs/wgpu/issues/1453
+                        render_pass.set_pipeline(&renderer.render_pipeline);
+                        render_pass.set_bind_group(0, &renderer.bind_group, &[]);
+                        render_pass.set_vertex_buffer(0, renderer.vertex_buffer.slice(..));
+                        render_pass.set_index_buffer(
+                            renderer.index_buffer.slice(..),
+                            wgpu::IndexFormat::Uint16,
+                        );
+                        render_pass.draw_indexed(0..INDICES.len() as u32, 0, 0..1);
+                    }
                 }
 
                 queue.submit(Some(encoder.finish()));
                 frame.present();
             }
             Event::UserEvent(UserEvent::NewFrameReady(data)) => {
-                renderer.new_frame(&queue, &data);
+                if let Some(renderer) = renderer.as_mut() {
+                    renderer.new_frame(&queue, &data);
+                }
                 window.request_redraw();
             }
             Event::WindowEvent {
@@ -170,7 +169,10 @@ async fn run(event_loop: EventLoop<UserEvent>, window: Window) {
     });
 }
 
-fn decode_video_and_play_audio(video_sender: Sender<Vec<u8>>) {
+fn decode_video_and_play_audio<F>(new_frame_callback: F)
+where
+    F: Fn(Vec<u8>) + Send + Sync + 'static,
+ {
     let path = std::env::args().nth(1).expect("No file provided");
     let mut format_context = FormatContext::new(&path).unwrap();
     format_context.open_input().unwrap();
@@ -314,7 +316,8 @@ fn decode_video_and_play_audio(video_sender: Sender<Vec<u8>>) {
                 prev_pts = Some(pts);
                 now = std::time::Instant::now();
 
-                video_sender.send(frame).unwrap();
+                new_frame_callback(frame);
+                // proxy.send_event(UserEvent::NewFrameReady(frame)).unwrap();
             }
         }
     });
