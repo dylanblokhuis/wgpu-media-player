@@ -4,30 +4,31 @@ use std::{
     sync::{Arc, Mutex},
     u8,
 };
+use tokio::sync::oneshot;
 use winit::{
+    dpi::PhysicalSize,
     event::{Event, WindowEvent},
-    event_loop::{ControlFlow, EventLoop, EventLoopBuilder},
-    window::Window,
+    event_loop::{ControlFlow, EventLoopBuilder},
 };
 
 mod media_decoder;
 mod renderer;
 mod texture;
 
-fn main() {
-    let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
-    let window = winit::window::Window::new(&event_loop).unwrap();
-    window.set_inner_size(winit::dpi::LogicalSize::new(1280, 900));
-
-    pollster::block_on(run(event_loop, window));
-}
-
 #[derive(Debug)]
 enum UserEvent {
     NewFrameReady(Vec<u8>),
 }
 
-async fn run(event_loop: EventLoop<UserEvent>, window: Window) {
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+    let window = winit::window::WindowBuilder::new()
+        .with_inner_size(winit::dpi::LogicalSize::new(1280, 720))
+        .with_title("wgpu-media-player")
+        .build(&event_loop)
+        .unwrap();
+
     let size = window.inner_size();
 
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -76,6 +77,9 @@ async fn run(event_loop: EventLoop<UserEvent>, window: Window) {
     surface.configure(&device, &config);
 
     let repaint_proxy = Arc::new(Mutex::new(event_loop.create_proxy()));
+    // let texture_size = Arc::new(Mutex::new(None));
+    let (video_size_sender, video_size_receiver) = oneshot::channel::<PhysicalSize<u32>>();
+
     std::thread::spawn(move || {
         let path = std::env::args().nth(1).expect("No file provided");
         let mut media_decoder = MediaDecoder::new(&path, move |frame| {
@@ -85,10 +89,21 @@ async fn run(event_loop: EventLoop<UserEvent>, window: Window) {
                 .send_event(UserEvent::NewFrameReady(frame))
                 .unwrap();
         });
+
+        let (width, height) = media_decoder.get_video_size();
+        video_size_sender
+            .send(PhysicalSize { width, height })
+            .unwrap();
+
         media_decoder.start();
     });
 
-    let mut renderer = Some(VideoRenderer::new(size, &device, &config));
+    let mut renderer = Some(VideoRenderer::new(
+        window.inner_size(),
+        video_size_receiver.await.unwrap(),
+        &device,
+        &config,
+    ));
 
     event_loop.run(move |event, _, control_flow| {
         // Have the closure take ownership of the resources.

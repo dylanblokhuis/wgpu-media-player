@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::slice;
+use std::sync::{Arc, Mutex};
 
 use cpal::{traits::StreamTrait, ChannelCount, SampleRate, Stream};
 use ringbuf::{HeapConsumer, HeapProducer, HeapRb};
@@ -13,7 +14,7 @@ const ONE_NANOSECOND: i64 = 1000000000;
 
 pub struct MediaDecoder {
     audio_producer: HeapProducer<f32>,
-    video_producer: HeapProducer<(i64, Vec<u8>)>,
+    video_queue: Arc<Mutex<VecDeque<(i64, Vec<u8>)>>>,
     _audio_stream: Stream,
     format_context: FormatContext,
     audio_decoder: AudioDecoder,
@@ -148,15 +149,21 @@ impl MediaDecoder {
             video_graph
         };
 
-        let (video_producer, mut video_consumer) = HeapRb::<(i64, Vec<u8>)>::new(50).split();
+        let video_queue = Arc::new(Mutex::new(VecDeque::new()));
         let (audio_producer, audio_consumer) = HeapRb::<f32>::new(50 * 1024 * 1024).split();
 
+        let video_queue_clone = video_queue.clone();
         std::thread::spawn(move || {
             let mut prev_pts = None;
             let mut now = std::time::Instant::now();
 
             loop {
-                if let Some((pts, frame)) = video_consumer.pop() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                println!(
+                    "video queue size: {}",
+                    video_queue_clone.lock().unwrap().len()
+                );
+                if let Some((pts, frame)) = video_queue_clone.lock().unwrap().pop_back() {
                     if let Some(prev) = prev_pts {
                         let elapsed = now.elapsed();
                         if pts > prev {
@@ -172,7 +179,6 @@ impl MediaDecoder {
                     now = std::time::Instant::now();
 
                     new_frame_callback(frame);
-                    // proxy.send_event(UserEvent::NewFrameReady(frame)).unwrap();
                 }
             }
         });
@@ -183,7 +189,7 @@ impl MediaDecoder {
 
         Self {
             audio_producer,
-            video_producer,
+            video_queue,
             _audio_stream,
             format_context,
             audio_decoder,
@@ -195,9 +201,16 @@ impl MediaDecoder {
         }
     }
 
+    pub fn get_video_size(&self) -> (u32, u32) {
+        let width = self.video_decoder.get_width();
+        let height = self.video_decoder.get_height();
+        (width as u32, height as u32)
+    }
+
     pub fn start(&mut self) {
         loop {
-            if self.video_producer.len() >= 50 {
+            if self.video_queue.lock().unwrap().len() >= 50 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
                 continue;
             }
 
@@ -224,18 +237,22 @@ impl MediaDecoder {
                     let size =
                         (self.video_decoder.get_height() * (*frame.frame).linesize[0]) as usize;
                     let rgba_data = slice::from_raw_parts((*frame.frame).data[0], size).to_vec();
-                    self.video_producer.push((pts_nano, rgba_data)).unwrap();
+                    self.video_queue
+                        .lock()
+                        .unwrap()
+                        .push_front((pts_nano, rgba_data));
                 }
             }
 
             if packet.get_stream_index() == self.audio_stream_index {
-                let frame = self.audio_decoder.decode(&packet).unwrap();
+                let Ok(frame) = self.audio_decoder.decode(&packet) else {
+                    continue;
+                };
                 let (frames, _) = self.audio_graph.process(&[frame], &[]).unwrap();
                 let frame = frames.first().unwrap();
 
                 unsafe {
                     let size = ((*frame.frame).channels * (*frame.frame).nb_samples) as usize;
-
                     let data: Vec<i32> =
                         slice::from_raw_parts((*frame.frame).data[0] as _, size).to_vec();
                     let float_samples: Vec<f32> = data

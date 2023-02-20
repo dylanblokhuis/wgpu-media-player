@@ -8,7 +8,8 @@ use crate::texture::Texture;
 pub const INDICES: &[u16] = &[0, 1, 2, 3, 4, 5];
 
 pub struct VideoRenderer {
-    size: PhysicalSize<u32>,
+    window_size: PhysicalSize<u32>,
+    video_size: PhysicalSize<u32>,
     pub render_pipeline: wgpu::RenderPipeline,
     pub bind_group: wgpu::BindGroup,
     pub vertex_buffer: wgpu::Buffer,
@@ -18,7 +19,8 @@ pub struct VideoRenderer {
 
 impl VideoRenderer {
     pub fn new(
-        size: PhysicalSize<u32>,
+        window_size: PhysicalSize<u32>,
+        video_size: PhysicalSize<u32>,
         device: &wgpu::Device,
         config: &wgpu::SurfaceConfiguration,
     ) -> Self {
@@ -54,7 +56,8 @@ impl VideoRenderer {
                 push_constant_ranges: &[],
             });
 
-        let texture_to_render = Texture::new(device, (1920, 1080), Some("Video")).unwrap();
+        let texture_to_render =
+            Texture::new(device, (video_size.width, video_size.height), Some("Video")).unwrap();
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &texture_bind_group_layout,
@@ -73,7 +76,7 @@ impl VideoRenderer {
 
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(&VideoRenderer::get_vertices(size)),
+            contents: bytemuck::cast_slice(&VideoRenderer::get_vertices(window_size, video_size)),
             usage: wgpu::BufferUsages::VERTEX,
         });
         let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -132,7 +135,8 @@ impl VideoRenderer {
         });
 
         Self {
-            size,
+            window_size,
+            video_size,
             bind_group,
             index_buffer,
             render_pipeline,
@@ -152,12 +156,12 @@ impl VideoRenderer {
             data,
             wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: NonZeroU32::new(4 * 1920),
-                rows_per_image: NonZeroU32::new(1080),
+                bytes_per_row: NonZeroU32::new(4 * self.video_size.width),
+                rows_per_image: NonZeroU32::new(self.video_size.height),
             },
             wgpu::Extent3d {
-                width: 1920,
-                height: 1080,
+                width: self.video_size.width,
+                height: self.video_size.height,
                 depth_or_array_layers: 1,
             },
         );
@@ -165,19 +169,19 @@ impl VideoRenderer {
 
     // resize vertex buffer, black bars etc..
     pub fn handle_resize(&mut self, device: &wgpu::Device, size: PhysicalSize<u32>) {
-        self.size = size;
+        self.window_size = size;
         self.vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(&VideoRenderer::get_vertices(size)),
+            contents: bytemuck::cast_slice(&VideoRenderer::get_vertices(size, self.video_size)),
             usage: wgpu::BufferUsages::VERTEX,
         });
     }
 
-    fn get_vertices(size: PhysicalSize<u32>) -> Vec<Vertex> {
-        let screen_width = size.width as f32;
-        let screen_height = size.height as f32;
+    fn get_vertices(window_size: PhysicalSize<u32>, video_size: PhysicalSize<u32>) -> Vec<Vertex> {
+        let screen_width = window_size.width as f32;
+        let screen_height = window_size.height as f32;
 
-        let desired_aspect_ratio = 16.0 / 9.0;
+        let desired_aspect_ratio = video_size.width as f32 / video_size.height as f32;
 
         let mut vertex_width = 1.0;
         let mut vertex_height = screen_width / desired_aspect_ratio / screen_height;
