@@ -6,6 +6,7 @@ use cpal::{traits::StreamTrait, ChannelCount, SampleRate, Stream};
 use ringbuf::{HeapConsumer, HeapProducer, HeapRb};
 use stainless_ffmpeg::prelude::FormatContext;
 use stainless_ffmpeg::prelude::*;
+use stainless_ffmpeg::probe::Probe;
 
 // Since the Rust time-functions `Duration` and `Instant` work with nanoseconds
 // by default, it is much simpler to convert a PTS to nanoseconds,
@@ -30,6 +31,10 @@ impl MediaDecoder {
     where
         F: Fn(Vec<u8>) + Send + Sync + 'static,
     {
+        let mut probe = Probe::new(path_or_url);
+        probe.process(log::LevelFilter::Off).unwrap();
+        println!("{:?}", probe);
+        
         let mut format_context = FormatContext::new(path_or_url).unwrap();
         format_context.open_input().unwrap();
 
