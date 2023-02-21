@@ -1960,6 +1960,7 @@ dependencies = [
  "bytemuck",
  "cpal",
  "crossbeam-channel",
+ "log",
  "ringbuf",
  "spin_sleep",
  "stainless_ffmpeg",
