@@ -1,0 +1,3 @@
+[submodule "stainless-ffmpeg"]
+	path = stainless-ffmpeg
+	url = https://github.com/dylanblokhuis/stainless-ffmpeg

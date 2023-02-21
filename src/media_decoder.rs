@@ -8,7 +8,6 @@ use stainless_ffmpeg::prelude::FormatContext;
 use stainless_ffmpeg::prelude::*;
 use stainless_ffmpeg::probe::Probe;
 use winit::dpi::PhysicalSize;
-
 // Since the Rust time-functions `Duration` and `Instant` work with nanoseconds
 // by default, it is much simpler to convert a PTS to nanoseconds,
 // that is why the following constant has been added.
@@ -127,35 +126,38 @@ impl MediaDecoder {
                 .add_input_from_video_decoder("source_video", &video_decoder)
                 .unwrap();
 
-            let mut parameters = HashMap::new();
-            parameters.insert(
-                "pix_fmts".to_string(),
-                ParameterValue::String("rgba".to_string()),
-            );
+            let format_filter = {
+                let mut parameters = HashMap::new();
+                parameters.insert(
+                    "pix_fmts".to_string(),
+                    ParameterValue::String("rgba".to_string()),
+                );
 
-            let filter = Filter {
-                name: "format".to_string(),
-                label: Some("Format video".to_string()),
-                parameters,
-                inputs: None,
-                outputs: None,
+                let filter = Filter {
+                    name: "format".to_string(),
+                    label: Some("Format video".to_string()),
+                    parameters,
+                    inputs: None,
+                    outputs: None,
+                };
+
+                video_graph.add_filter(&filter).unwrap()
             };
 
-            let filter = video_graph.add_filter(&filter).unwrap();
             video_graph.add_video_output("main_video").unwrap();
 
             video_graph
-                .connect_input("source_video", 0, &filter, 0)
+                .connect_input("source_video", 0, &format_filter, 0)
                 .unwrap();
             video_graph
-                .connect_output(&filter, 0, "main_video", 0)
+                .connect_output(&format_filter, 0, "main_video", 0)
                 .unwrap();
             video_graph.validate().unwrap();
 
             video_graph
         };
 
-        let video_queue = Arc::new(Mutex::new(VecDeque::new()));
+        let video_queue = Arc::new(Mutex::new(VecDeque::with_capacity(10)));
         let (audio_producer, audio_consumer) = HeapRb::<f32>::new(50 * 1024 * 1024).split();
 
         let video_queue_clone = video_queue.clone();
@@ -215,7 +217,7 @@ impl MediaDecoder {
 
     pub fn start(&mut self) {
         loop {
-            if self.video_queue.lock().unwrap().len() >= 50 {
+            if self.video_queue.lock().unwrap().len() >= 10 {
                 std::thread::sleep(std::time::Duration::from_millis(10));
                 continue;
             }
@@ -228,20 +230,36 @@ impl MediaDecoder {
                 let Ok(frame) = self.video_decoder.decode(&packet) else {
                     continue;
                 };
-                let (_, frames) = self.video_graph.process(&[], &[frame]).unwrap();
-                let frame = frames.first().unwrap();
 
                 unsafe {
+                    let bet = (*frame.frame).best_effort_timestamp;
+                    let sw_frame = av_frame_alloc();
+                    let tmp_frame =
+                        if (*frame.frame).format == self.video_decoder.pixel_format as i32 {
+                            av_hwframe_transfer_data(sw_frame, frame.frame, 0);
+                            sw_frame
+                        } else {
+                            frame.frame
+                        };
+
+                    let (_, frames) = self
+                        .video_graph
+                        .process(
+                            &[],
+                            &[Frame {
+                                frame: tmp_frame,
+                                index: self.video_stream_index as usize,
+                                name: None,
+                            }],
+                        )
+                        .unwrap();
+                    let frame = frames.first().unwrap();
+
                     let stream =
                         (*self.format_context.get_stream(self.video_stream_index)).time_base;
-                    let pts_nano = av_rescale_q(
-                        (*frame.frame).best_effort_timestamp,
-                        stream,
-                        av_make_q(1, ONE_NANOSECOND as i32),
-                    );
+                    let pts_nano = av_rescale_q(bet, stream, av_make_q(1, ONE_NANOSECOND as i32));
 
-                    let size =
-                        (self.video_decoder.get_height() * (*frame.frame).linesize[0]) as usize;
+                    let size = ((*frame.frame).height * (*frame.frame).linesize[0]) as usize;
                     let rgba_data = slice::from_raw_parts((*frame.frame).data[0], size).to_vec();
                     self.video_queue
                         .lock()

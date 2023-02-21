@@ -1518,8 +1518,6 @@ dependencies = [
 [[package]]
 name = "stainless_ffmpeg"
 version = "0.3.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c09eb539b7601bd7a0ad62f5d055a17b09f4ded452669c282bed87090f41b4c"
 dependencies = [
  "ffmpeg-sys-next",
  "libc",

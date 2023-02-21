@@ -3,3 +3,5 @@ saga.mkv
 ./ffmpeg
 ./vcpkg
 .vscode
+ffmpeg-nvenc
+stainless-ffmpeg

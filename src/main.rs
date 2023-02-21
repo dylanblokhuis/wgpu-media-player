@@ -1,5 +1,6 @@
 use media_decoder::MediaDecoder;
 use renderer::{VideoRenderer, INDICES};
+
 use std::{
     sync::{Arc, Mutex},
     u8,
