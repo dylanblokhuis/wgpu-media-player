@@ -77,7 +77,6 @@ async fn main() {
     surface.configure(&device, &config);
 
     let repaint_proxy = Arc::new(Mutex::new(event_loop.create_proxy()));
-    // let texture_size = Arc::new(Mutex::new(None));
     let (video_size_sender, video_size_receiver) = oneshot::channel::<PhysicalSize<u32>>();
 
     std::thread::spawn(move || {
@@ -90,9 +89,8 @@ async fn main() {
                 .unwrap();
         });
 
-        let (width, height) = media_decoder.get_video_size();
         video_size_sender
-            .send(PhysicalSize { width, height })
+            .send(media_decoder.get_video_size())
             .unwrap();
 
         media_decoder.start();
@@ -171,9 +169,7 @@ async fn main() {
                 frame.present();
             }
             Event::UserEvent(UserEvent::NewFrameReady(data)) => {
-                if let Some(renderer) = renderer.as_mut() {
-                    renderer.new_frame(&queue, &data);
-                }
+                renderer.as_mut().unwrap().new_frame(&queue, &data);
                 window.request_redraw();
             }
             Event::WindowEvent {

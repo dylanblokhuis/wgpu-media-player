@@ -6,6 +6,7 @@ use cpal::{traits::StreamTrait, ChannelCount, SampleRate, Stream};
 use ringbuf::{HeapConsumer, HeapProducer, HeapRb};
 use stainless_ffmpeg::prelude::FormatContext;
 use stainless_ffmpeg::prelude::*;
+use winit::dpi::PhysicalSize;
 
 // Since the Rust time-functions `Duration` and `Instant` work with nanoseconds
 // by default, it is much simpler to convert a PTS to nanoseconds,
@@ -201,10 +202,10 @@ impl MediaDecoder {
         }
     }
 
-    pub fn get_video_size(&self) -> (u32, u32) {
+    pub fn get_video_size(&self) -> PhysicalSize<u32> {
         let width = self.video_decoder.get_width();
         let height = self.video_decoder.get_height();
-        (width as u32, height as u32)
+        PhysicalSize::new(width as u32, height as u32)
     }
 
     pub fn start(&mut self) {
