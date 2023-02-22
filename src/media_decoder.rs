@@ -13,10 +13,18 @@ use winit::dpi::PhysicalSize;
 // that is why the following constant has been added.
 const ONE_NANOSECOND: i64 = 1000000000;
 
+#[derive(PartialEq, Debug, Eq)]
+enum PlaybackState {
+    Playing,
+    Paused,
+    Stopped,
+    Buffering,
+}
+
 pub struct MediaDecoder {
     audio_producer: HeapProducer<f32>,
     video_queue: Arc<Mutex<VecDeque<(i64, Vec<u8>)>>>,
-    _audio_stream: Stream,
+    audio_stream: Stream,
     format_context: FormatContext,
     audio_decoder: AudioDecoder,
     video_decoder: VideoDecoder,
@@ -24,6 +32,7 @@ pub struct MediaDecoder {
     video_graph: FilterGraph,
     audio_stream_index: isize,
     video_stream_index: isize,
+    playback_state: PlaybackState,
 }
 
 impl MediaDecoder {
@@ -191,14 +200,13 @@ impl MediaDecoder {
             }
         });
 
-        let _audio_stream =
+        let audio_stream =
             setup_audio_stream(audio_consumer, channels, SampleRate(resample_rate as u32));
-        _audio_stream.play().unwrap();
 
         Self {
             audio_producer,
             video_queue,
-            _audio_stream,
+            audio_stream,
             format_context,
             audio_decoder,
             video_decoder,
@@ -206,6 +214,7 @@ impl MediaDecoder {
             video_graph,
             video_stream_index: first_video_stream,
             audio_stream_index: first_audio_stream,
+            playback_state: PlaybackState::Stopped,
         }
     }
 
@@ -216,7 +225,15 @@ impl MediaDecoder {
     }
 
     pub fn start(&mut self) {
+        self.playback_state = PlaybackState::Playing;
+        self.audio_stream.play().unwrap();
+
         loop {
+            if self.playback_state == PlaybackState::Paused {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
+            }
+
             if self.video_queue.lock().unwrap().len() >= 10 {
                 std::thread::sleep(std::time::Duration::from_millis(10));
                 continue;
@@ -289,6 +306,17 @@ impl MediaDecoder {
             }
         }
     }
+
+    pub fn pause(&mut self) {
+        self.playback_state = PlaybackState::Paused;
+        self.audio_stream.pause().unwrap();
+    }
+    // pub fn send_command(&mut self, command: Command) {
+    //     match command {
+    //         Command::Pause => self.pause(),
+    //         Command::Stop => unreachable!(),
+    //     }
+    // }
 }
 
 fn setup_audio_stream(

@@ -12,6 +12,7 @@ use winit::{
     event_loop::{ControlFlow, EventLoopBuilder},
 };
 
+mod app;
 mod media_decoder;
 mod renderer;
 mod texture;
@@ -65,7 +66,7 @@ async fn main() {
     let swapchain_capabilities = surface.get_capabilities(&adapter);
     let swapchain_format = swapchain_capabilities.formats[0];
 
-    let mut config = wgpu::SurfaceConfiguration {
+    let config = wgpu::SurfaceConfiguration {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         format: swapchain_format,
         width: size.width,
@@ -79,9 +80,11 @@ async fn main() {
 
     let repaint_proxy = Arc::new(Mutex::new(event_loop.create_proxy()));
     let (video_size_sender, video_size_receiver) = oneshot::channel::<PhysicalSize<u32>>();
+    let (load_file_sender, load_file_receiver) = oneshot::channel::<String>();
 
     std::thread::spawn(move || {
-        let path = std::env::args().nth(1).expect("No file provided");
+        let path = load_file_receiver.blocking_recv().unwrap();
+
         let mut media_decoder = MediaDecoder::new(&path, move |frame| {
             repaint_proxy
                 .lock()
@@ -97,12 +100,29 @@ async fn main() {
         media_decoder.start();
     });
 
-    let mut renderer = Some(VideoRenderer::new(
-        window.inner_size(),
-        video_size_receiver.await.unwrap(),
-        &device,
-        &config,
-    ));
+    let device = Arc::new(device);
+    let config = Arc::new(Mutex::new(config));
+    let renderer = Arc::new(Mutex::new(None));
+
+    {
+        let device = device.clone();
+        let config = config.clone();
+        let renderer = renderer.clone();
+        let window_inner_size = window.inner_size();
+        std::thread::spawn(move || {
+            let size = video_size_receiver.blocking_recv().unwrap();
+            *renderer.lock().unwrap() = Some(VideoRenderer::new(
+                window_inner_size,
+                size,
+                device,
+                config.lock().unwrap().clone(),
+            ));
+        });
+    }
+    let mut app = app::App::new();
+    app.set_on_load_file_request(move |path| {
+        load_file_sender.send(path).unwrap();
+    });
 
     event_loop.run(move |event, _, control_flow| {
         // Have the closure take ownership of the resources.
@@ -113,22 +133,54 @@ async fn main() {
         *control_flow = ControlFlow::Wait;
 
         match event {
-            Event::WindowEvent {
-                event: WindowEvent::Resized(size),
-                ..
-            } => {
-                // Reconfigure the surface with the new size
-                config.width = size.width;
-                config.height = size.height;
-                surface.configure(&device, &config);
-
-                if let Some(renderer) = renderer.as_mut() {
-                    renderer.handle_resize(&device, size);
+            Event::WindowEvent { event, .. } => {
+                if matches!(event, WindowEvent::CloseRequested | WindowEvent::Destroyed) {
+                    *control_flow = ControlFlow::Exit;
                 }
 
-                // On macos the window needs to be redrawn manually after resizing
-                window.request_redraw();
+                if let WindowEvent::Resized(size) = &event {
+                    config.lock().unwrap().width = size.width;
+                    config.lock().unwrap().height = size.height;
+                    surface.configure(&device, &config.lock().unwrap());
+
+                    if let Some(renderer) = renderer.lock().unwrap().as_mut() {
+                        renderer.handle_resize(&device, *size);
+                    }
+
+                    // On macos the window needs to be redrawn manually after resizing
+                    window.request_redraw();
+                } else if let WindowEvent::ScaleFactorChanged {
+                    new_inner_size: size,
+                    ..
+                } = &event
+                {
+                    config.lock().unwrap().width = size.width;
+                    config.lock().unwrap().height = size.height;
+                    surface.configure(&device, &config.lock().unwrap());
+
+                    if let Some(renderer) = renderer.lock().unwrap().as_mut() {
+                        renderer.handle_resize(&device, **size);
+                    }
+
+                    // On macos the window needs to be redrawn manually after resizing
+                    window.request_redraw();
+                }
+
+                // if let WindowEvent::DroppedFile(path) = &event {
+                //     if let Some(load_file_sender) = load_file_sender.take() {
+                //         load_file_sender
+                //             .send(
+                //                 path.to_str()
+                //                     .expect("Failed to convert path to string")
+                //                     .to_string(),
+                //             )
+                //             .unwrap();
+                //     }
+                // }
+
+                app.handle_window_event(&event);
             }
+
             Event::RedrawRequested(_) => {
                 let frame = surface
                     .get_current_texture()
@@ -153,7 +205,7 @@ async fn main() {
                         depth_stencil_attachment: None,
                     });
 
-                    if let Some(renderer) = renderer.as_mut() {
+                    if let Some(renderer) = renderer.lock().unwrap().as_mut() {
                         // im not going to bother -> https://github.com/gfx-rs/wgpu/issues/1453
                         render_pass.set_pipeline(&renderer.render_pipeline);
                         render_pass.set_bind_group(0, &renderer.bind_group, &[]);
@@ -170,13 +222,11 @@ async fn main() {
                 frame.present();
             }
             Event::UserEvent(UserEvent::NewFrameReady(data)) => {
-                renderer.as_mut().unwrap().new_frame(&queue, &data);
+                if let Some(renderer) = renderer.lock().unwrap().as_mut() {
+                    renderer.new_frame(&queue, &data);
+                }
                 window.request_redraw();
             }
-            Event::WindowEvent {
-                event: WindowEvent::CloseRequested,
-                ..
-            } => *control_flow = ControlFlow::Exit,
             _ => {}
         }
     });

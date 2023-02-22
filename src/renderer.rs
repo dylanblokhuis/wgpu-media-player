@@ -1,4 +1,4 @@
-use std::num::NonZeroU32;
+use std::{num::NonZeroU32, sync::Arc};
 
 use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
@@ -21,8 +21,8 @@ impl VideoRenderer {
     pub fn new(
         window_size: PhysicalSize<u32>,
         video_size: PhysicalSize<u32>,
-        device: &wgpu::Device,
-        config: &wgpu::SurfaceConfiguration,
+        device: Arc<wgpu::Device>,
+        config: wgpu::SurfaceConfiguration,
     ) -> Self {
         let texture_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -56,8 +56,12 @@ impl VideoRenderer {
                 push_constant_ranges: &[],
             });
 
-        let texture_to_render =
-            Texture::new(device, (video_size.width, video_size.height), Some("Video")).unwrap();
+        let texture_to_render = Texture::new(
+            &device,
+            (video_size.width, video_size.height),
+            Some("Video"),
+        )
+        .unwrap();
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &texture_bind_group_layout,
