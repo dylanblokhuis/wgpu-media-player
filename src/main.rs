@@ -1,8 +1,12 @@
+use egui::FontDefinitions;
+use egui_wgpu_backend::{RenderPass, ScreenDescriptor};
+use egui_winit_platform::{Platform, PlatformDescriptor};
 use media_decoder::MediaDecoder;
 use renderer::{VideoRenderer, INDICES};
 
 use std::{
     sync::{Arc, Mutex},
+    time::Instant,
     u8,
 };
 use tokio::sync::oneshot;
@@ -20,6 +24,19 @@ mod texture;
 #[derive(Debug)]
 enum UserEvent {
     NewFrameReady(Vec<u8>),
+    RequestRedraw,
+}
+
+struct ExampleRepaintSignal(std::sync::Mutex<winit::event_loop::EventLoopProxy<UserEvent>>);
+
+impl epi::backend::RepaintSignal for ExampleRepaintSignal {
+    fn request_repaint(&self) {
+        self.0
+            .lock()
+            .unwrap()
+            .send_event(UserEvent::RequestRedraw)
+            .ok();
+    }
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -78,6 +95,18 @@ async fn main() {
 
     surface.configure(&device, &config);
 
+    // setup egui
+    let mut platform = Platform::new(PlatformDescriptor {
+        physical_width: size.width,
+        physical_height: size.height,
+        scale_factor: window.scale_factor(),
+        font_definitions: FontDefinitions::default(),
+        style: Default::default(),
+    });
+
+    let mut egui_rpass = RenderPass::new(&device, swapchain_format, 1);
+    let mut demo_app = egui_demo_lib::DemoWindows::default();
+
     let repaint_proxy = Arc::new(Mutex::new(event_loop.create_proxy()));
     let (video_size_sender, video_size_receiver) = oneshot::channel::<PhysicalSize<u32>>();
     let (load_file_sender, load_file_receiver) = oneshot::channel::<String>();
@@ -124,10 +153,12 @@ async fn main() {
         load_file_sender.send(path).unwrap();
     });
 
+    let start_time = Instant::now();
     event_loop.run(move |event, _, control_flow| {
         // Have the closure take ownership of the resources.
         // `event_loop.run` never returns, therefore we must do this to ensure
         // the resources are properly cleaned up.
+        platform.handle_event(&event);
         let _ = (&instance, &adapter);
 
         *control_flow = ControlFlow::Wait;
@@ -166,22 +197,14 @@ async fn main() {
                     window.request_redraw();
                 }
 
-                // if let WindowEvent::DroppedFile(path) = &event {
-                //     if let Some(load_file_sender) = load_file_sender.take() {
-                //         load_file_sender
-                //             .send(
-                //                 path.to_str()
-                //                     .expect("Failed to convert path to string")
-                //                     .to_string(),
-                //             )
-                //             .unwrap();
-                //     }
-                // }
-
                 app.handle_window_event(&event);
             }
-
+            Event::MainEventsCleared | Event::UserEvent(UserEvent::RequestRedraw) => {
+                window.request_redraw();
+            }
             Event::RedrawRequested(_) => {
+                platform.update_time(start_time.elapsed().as_secs_f64());
+
                 let frame = surface
                     .get_current_texture()
                     .expect("Failed to acquire next swap chain texture");
@@ -198,7 +221,7 @@ async fn main() {
                             view: &view,
                             resolve_target: None,
                             ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                load: wgpu::LoadOp::Load,
                                 store: true,
                             },
                         })],
@@ -218,8 +241,40 @@ async fn main() {
                     }
                 }
 
+                // Begin to draw the UI frame.
+                platform.begin_frame();
+
+                // Draw the demo application.
+                demo_app.ui(&platform.context());
+
+                let full_output = platform.end_frame(Some(&window));
+                let paint_jobs = platform.context().tessellate(full_output.shapes);
+
+                // Upload all resources for the GPU.
+                let width = config.lock().unwrap().width;
+                let height = config.lock().unwrap().height;
+                let screen_descriptor = ScreenDescriptor {
+                    physical_width: width,
+                    physical_height: height,
+                    scale_factor: window.scale_factor() as f32,
+                };
+                let tdelta: egui::TexturesDelta = full_output.textures_delta;
+                egui_rpass
+                    .add_textures(&device, &queue, &tdelta)
+                    .expect("add texture ok");
+                egui_rpass.update_buffers(&device, &queue, &paint_jobs, &screen_descriptor);
+
+                // Record all render passes.
+                egui_rpass
+                    .execute(&mut encoder, &view, &paint_jobs, &screen_descriptor, None)
+                    .unwrap();
+
                 queue.submit(Some(encoder.finish()));
                 frame.present();
+
+                egui_rpass
+                    .remove_textures(tdelta)
+                    .expect("remove texture ok");
             }
             Event::UserEvent(UserEvent::NewFrameReady(data)) => {
                 if let Some(renderer) = renderer.lock().unwrap().as_mut() {
