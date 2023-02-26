@@ -11,7 +11,6 @@ derive_more = "0.99.17"
 gstreamer = "0.20.2"
 gstreamer-app = "0.20.0"
 bytemuck = { version = "1.13.0", features = ["derive"] }
-cpal = "0.15.0"
 crossbeam-channel = "0.5.6"
 wgpu = "0.15.1"
 winit = "0.28.1"
