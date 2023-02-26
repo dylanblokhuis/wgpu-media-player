@@ -52,7 +52,7 @@ impl App {
                     if self.input.modifiers.command && keycode == VirtualKeyCode::V {
                         if let Ok(path_or_url) = self.clipboard.get_contents() {
                             if let Some(on_load_file_request) = self.on_load_file_request.take() {
-                                on_load_file_request(path_or_url);
+                                on_load_file_request(format!("file://{}", path_or_url));
                             }
                         }
                     }
@@ -60,7 +60,7 @@ impl App {
             }
             WindowEvent::DroppedFile(path) => {
                 if let Some(on_load_file_request) = self.on_load_file_request.take() {
-                    on_load_file_request(path.to_string_lossy().to_string());
+                    on_load_file_request(format!("file://{}", path.to_string_lossy()));
                 }
             }
             _ => {}

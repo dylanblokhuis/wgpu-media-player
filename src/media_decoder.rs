@@ -1,19 +1,21 @@
 use anyhow::Error;
 use crossbeam_channel::Sender;
 use gst::{element_warning, prelude::*};
+use gstreamer_video::VideoInfo;
 
 pub struct MediaDecoder;
 
 impl MediaDecoder {
-    pub fn new(path_or_url: &str, new_frame_callback: Sender<Vec<u8>>) -> Result<Self, Error> {
+    pub fn new(
+        path_or_url: &str,
+        video_info_sender: Sender<VideoInfo>,
+        new_frame_sender: Sender<Vec<u8>>,
+    ) -> Result<Self, Error> {
         gst::init()?;
 
         let pipeline = gst::Pipeline::default();
         let decodebin = gst::ElementFactory::make("uridecodebin")
-            .property(
-                "uri",
-                r#"http://192.168.178.48:32400/library/parts/1386/1676086764/file.mkv?download=1&X-Plex-Token=pz-yPEh-emTJ_VEb71CS"#,
-            )
+            .property("uri", path_or_url)
             .build()?;
         // let decodebin = gst::ElementFactory::make("decodebin").build()?;
 
@@ -48,6 +50,7 @@ impl MediaDecoder {
                 let media_type = src_pad.current_caps().and_then(|caps| {
                     caps.structure(0).map(|s| {
                         let name = s.name();
+                        println!("name: {}", name);
                         (name.starts_with("audio/"), name.starts_with("video/"))
                     })
                 });
@@ -96,11 +99,8 @@ impl MediaDecoder {
                     let sink_pad = queue.static_pad("sink").expect("queue has no sinkpad");
                     src_pad.link(&sink_pad)?;
                 } else if is_video {
-                    //     // decodebin found a raw videostream, so we build the follow-up pipeline to
-                    //     // display it using the autovideosink.
                     let queue = gst::ElementFactory::make("queue").build()?;
                     let convert = gst::ElementFactory::make("videoconvert").build()?;
-                    let scale = gst::ElementFactory::make("videoscale").build()?;
                     let appsink = gst_app::AppSink::builder()
                         .caps(
                             &gst::Caps::builder("video/x-raw")
@@ -109,7 +109,7 @@ impl MediaDecoder {
                         )
                         .build();
 
-                    let elements = &[&queue, &convert, &scale, (appsink.upcast_ref())];
+                    let elements = &[&queue, &convert, (appsink.upcast_ref())];
                     pipeline.add_many(elements)?;
                     gst::Element::link_many(elements)?;
 
@@ -117,19 +117,32 @@ impl MediaDecoder {
                         e.sync_state_with_parent()?
                     }
 
-                    let cl = new_frame_callback.clone();
+                    let new_frame_sender_clone = new_frame_sender.clone();
+                    let video_info_sender_clone = video_info_sender.clone();
+
+                    let mut has_sent_info = false;
+
                     appsink.set_callbacks(
                         gst_app::AppSinkCallbacks::builder()
                             .new_sample(move |appsink| {
                                 let sample =
                                     appsink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+
+                                if !has_sent_info {
+                                    let info =
+                                        gst_video::VideoInfo::from_caps(sample.caps().unwrap())
+                                            .unwrap();
+                                    video_info_sender_clone.send(info).unwrap();
+                                    has_sent_info = true;
+                                }
+
                                 let buffer = sample.buffer().unwrap();
 
                                 let map = buffer.map_readable().unwrap();
 
                                 let data = map.as_slice();
 
-                                cl.send(data.to_vec()).unwrap();
+                                new_frame_sender_clone.send(data.to_vec()).unwrap();
                                 Ok(gst::FlowSuccess::Ok)
                             })
                             .build(),

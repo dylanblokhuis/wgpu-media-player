@@ -1,10 +1,12 @@
 extern crate gstreamer as gst;
 extern crate gstreamer_app as gst_app;
+extern crate gstreamer_video as gst_video;
 
 use crossbeam_channel::bounded;
 use egui::FontDefinitions;
 use egui_wgpu_backend::{RenderPass, ScreenDescriptor};
 use egui_winit_platform::{Platform, PlatformDescriptor};
+use gst_video::VideoInfo;
 use media_decoder::MediaDecoder;
 use renderer::{VideoRenderer, INDICES};
 
@@ -77,7 +79,7 @@ async fn main() {
                 label: None,
                 features: wgpu::Features::empty(),
                 // Make sure we use the texture resolution limits from the adapter, so we can support images the size of the swapchain.
-                limits: wgpu::Limits::downlevel_webgl2_defaults(),
+                limits: wgpu::Limits::default(),
             },
             None,
         )
@@ -119,6 +121,7 @@ async fn main() {
         let path = load_file_receiver.blocking_recv().unwrap();
 
         let (video_frame_sender, video_frame_receiver) = bounded::<Vec<u8>>(1);
+        let (video_info_sender, video_info_receiver) = bounded::<VideoInfo>(1);
 
         std::thread::spawn(move || loop {
             let frame = video_frame_receiver.recv().unwrap();
@@ -129,14 +132,17 @@ async fn main() {
                 .unwrap();
         });
 
-        video_size_sender
-            .send(PhysicalSize {
-                width: 3840,
-                height: 2160,
-            })
-            .unwrap();
+        std::thread::spawn(move || {
+            let info = video_info_receiver.recv().unwrap();
+            video_size_sender
+                .send(PhysicalSize {
+                    width: info.width(),
+                    height: info.height(),
+                })
+                .unwrap();
+        });
 
-        MediaDecoder::new(&path, video_frame_sender).unwrap();
+        MediaDecoder::new(&path, video_info_sender, video_frame_sender).unwrap();
 
         // while let Ok(frame) = video_frame_receiver.recv() {
         //     repaint_proxy
