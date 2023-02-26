@@ -1,14 +1,18 @@
 [package]
-name = "wgpu-media-player"
+name = "wgpu-gstreamer"
 version = "0.1.0"
 edition = "2021"
 
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
 [dependencies]
 anyhow = "1.0.69"
+derive_more = "0.99.17"
+gstreamer = "0.20.2"
+gstreamer-app = "0.20.0"
 bytemuck = { version = "1.13.0", features = ["derive"] }
 cpal = "0.15.0"
 crossbeam-channel = "0.5.6"
-stainless_ffmpeg = { path = "./stainless-ffmpeg" }
 wgpu = "0.15.1"
 winit = "0.28.1"
 ringbuf = "0.3.2"

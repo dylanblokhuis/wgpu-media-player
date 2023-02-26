@@ -1,3 +1,7 @@
+extern crate gstreamer as gst;
+extern crate gstreamer_app as gst_app;
+
+use crossbeam_channel::bounded;
 use egui::FontDefinitions;
 use egui_wgpu_backend::{RenderPass, ScreenDescriptor};
 use egui_winit_platform::{Platform, PlatformDescriptor};
@@ -73,7 +77,7 @@ async fn main() {
                 label: None,
                 features: wgpu::Features::empty(),
                 // Make sure we use the texture resolution limits from the adapter, so we can support images the size of the swapchain.
-                limits: wgpu::Limits::default(),
+                limits: wgpu::Limits::downlevel_webgl2_defaults(),
             },
             None,
         )
@@ -114,7 +118,10 @@ async fn main() {
     std::thread::spawn(move || {
         let path = load_file_receiver.blocking_recv().unwrap();
 
-        let mut media_decoder = MediaDecoder::new(&path, move |frame| {
+        let (video_frame_sender, video_frame_receiver) = bounded::<Vec<u8>>(1);
+
+        std::thread::spawn(move || loop {
+            let frame = video_frame_receiver.recv().unwrap();
             repaint_proxy
                 .lock()
                 .unwrap()
@@ -123,10 +130,22 @@ async fn main() {
         });
 
         video_size_sender
-            .send(media_decoder.get_video_size())
+            .send(PhysicalSize {
+                width: 3840,
+                height: 2160,
+            })
             .unwrap();
 
-        media_decoder.start();
+        MediaDecoder::new(&path, video_frame_sender).unwrap();
+
+        // while let Ok(frame) = video_frame_receiver.recv() {
+        //     repaint_proxy
+        //         .lock()
+        //         .unwrap()
+        //         .send_event(UserEvent::NewFrameReady(frame))
+        //         .unwrap();
+        // }
+        // media_decoder.start();
     });
 
     let device = Arc::new(device);
