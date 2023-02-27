@@ -35,6 +35,16 @@ impl App {
     }
 
     pub fn handle_window_event(&mut self, event: &WindowEvent) {
+        fn format_url(url: &str) -> String {
+            if url.starts_with("http") {
+                url.to_string()
+            } else if cfg!(target_os = "windows") {
+                format!("file:///{}", url.replace('\\', "/"))
+            } else {
+                format!("file://{}", url)
+            }
+        }
+
         match event {
             WindowEvent::ModifiersChanged(state) => {
                 self.input.modifiers.alt = state.alt();
@@ -52,7 +62,7 @@ impl App {
                     if self.input.modifiers.command && keycode == VirtualKeyCode::V {
                         if let Ok(path_or_url) = self.clipboard.get_contents() {
                             if let Some(on_load_file_request) = self.on_load_file_request.take() {
-                                on_load_file_request(format!("{}", path_or_url));
+                                on_load_file_request(format_url(&path_or_url));
                             }
                         }
                     }
@@ -60,7 +70,7 @@ impl App {
             }
             WindowEvent::DroppedFile(path) => {
                 if let Some(on_load_file_request) = self.on_load_file_request.take() {
-                    on_load_file_request(format!("{}", path.to_string_lossy()));
+                    on_load_file_request(format_url(&path.to_string_lossy()));
                 }
             }
             _ => {}
