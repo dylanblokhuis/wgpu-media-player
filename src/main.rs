@@ -174,9 +174,11 @@ async fn main() {
         });
     }
     let mut app = app::App::new();
-    app.set_on_load_file_request(move |path| {
-        load_file_sender.send(path).unwrap();
-    });
+    // app.set_on_load_file_request(move |path| {
+    //     load_file_sender.send(path).unwrap();
+    // });
+
+    load_file_sender.send("http://192.168.178.48:32400/library/parts/1391/1676306688/file.mkv?download=1&X-Plex-Token=pz-yPEh-emTJ_VEb71CS".to_string()).unwrap();
 
     let start_time = Instant::now();
     event_loop.run(move |event, _, control_flow| {

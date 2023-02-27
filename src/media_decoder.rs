@@ -182,11 +182,14 @@ impl MediaDecoder {
 
         pipeline.set_state(gst::State::Playing)?;
 
+        let target_state = gst::State::Playing;
+
         let bus = pipeline.bus().unwrap();
         for msg in bus.iter_timed(gst::ClockTime::NONE) {
             use gst::MessageView;
             match msg.view() {
                 MessageView::Eos(..) => {
+                    pipeline.set_state(gst::State::Paused)?;
                     println!("received eos");
                     // An EndOfStream event was sent to the pipeline, so exit
                     break;
@@ -200,6 +203,26 @@ impl MediaDecoder {
                     );
                     break;
                 }
+                MessageView::Buffering(msg) => {
+                    let percent = msg.percent();
+                    if percent < 100 && target_state >= gst::State::Paused {
+                        println!("Buffering {}%", percent);
+                        pipeline.set_state(gst::State::Paused)?;
+                    } else if target_state >= gst::State::Playing {
+                        pipeline.set_state(gst::State::Playing)?;
+                    } else if target_state >= gst::State::Paused {
+                        println!("Buffering complete");
+                    }
+                }
+                MessageView::ClockLost(_) => {
+                    if target_state >= gst::State::Playing {
+                        pipeline.set_state(gst::State::Paused)?;
+                        pipeline.set_state(gst::State::Playing)?;
+                    }
+                }
+                // MessageView::StateChanged(msg) => {
+                //     println!("state changed {:?}", msg.message());
+                // }
                 _ => (),
             }
         }
