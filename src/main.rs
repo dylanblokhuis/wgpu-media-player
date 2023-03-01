@@ -164,7 +164,9 @@ async fn main() {
         let renderer = renderer.clone();
         let window_inner_size = window.inner_size();
         std::thread::spawn(move || {
-            let size = video_size_receiver.blocking_recv().unwrap();
+            let size = video_size_receiver
+                .blocking_recv()
+                .expect("Failed to get initial video size");
             *renderer.lock().unwrap() = Some(VideoRenderer::new(
                 window_inner_size,
                 size,
